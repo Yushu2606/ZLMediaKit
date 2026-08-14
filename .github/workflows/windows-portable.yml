@@ -1,0 +1,77 @@
+name: Windows Portable
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 下载submodule源码
+        run: mv -Force .gitmodules_github .gitmodules && git submodule sync && git submodule update --init
+
+      - name: 配置 vcpkg
+        uses: lukka/run-vcpkg@v7
+        with:
+          vcpkgDirectory: '${{github.workspace}}/vcpkg'
+          vcpkgTriplet: x64-windows-static
+          vcpkgGitCommitId: 'efcfaaf60d7ec57a159fc3110403d939bfb69729'
+          vcpkgArguments: 'openssl libsrtp[openssl] usrsctp'
+
+      - name: 编译
+        uses: lukka/run-cmake@v3
+        with:
+          useVcpkgToolchainFile: true
+          buildDirectory: '${{github.workspace}}/build'
+          # CMP0091 is already NEW via cmake_minimum_required(3.1.3...3.26), which makes
+          # the project's own /MD->/MT string replace (CMakeLists.txt line 542) a no-op.
+          # This variable is the actual knob that controls the runtime library under CMP0091=NEW.
+          cmakeAppendedArgs: '-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded'
+          cmakeBuildType: 'Release'
+
+      - name: 精简打包
+        shell: pwsh
+        run: |
+          $src = 'release/windows/Release'
+          New-Item -ItemType Directory dist | Out-Null
+          Copy-Item "$src/MediaServer.exe" dist/
+          Copy-Item "$src/config.ini"      dist/
+          Copy-Item "$src/default.pem"     dist/
+
+          # Import-table names are plain ASCII in the PE; scan for the dynamic CRT.
+          $blob = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes("$src/MediaServer.exe"))
+          if ($blob -match 'VCRUNTIME140\.dll') {
+            Write-Host '::warning::static CRT NOT applied - bundling VC runtime DLLs'
+            foreach ($d in 'MSVCP140.dll','VCRUNTIME140.dll','VCRUNTIME140_1.dll') {
+              Copy-Item "$env:WINDIR\System32\$d" dist/
+            }
+          } else {
+            Write-Host 'static CRT OK - fully self-contained, no VC redist needed'
+          }
+
+          Get-ChildItem dist | Format-Table Name, Length
+          Compress-Archive -Path dist/* -DestinationPath MediaServer-win64-portable.zip
+
+      - name: 上传 artifact 备份
+        uses: actions/upload-artifact@v4
+        with:
+          name: MediaServer-win64-portable
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: 发布 Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "portable-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+          gh release create $tag MediaServer-win64-portable.zip `
+            --title "MediaServer 便携版 $tag" `
+            --notes "commit: ${{ github.sha }}"
